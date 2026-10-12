@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 import threading
 import time
@@ -435,6 +436,9 @@ class KVPoolWorker:
         self.kv_recv_thread: KVTransferThread | None = None
         self._previous_save_batch: KVCacheStoreBatch | None = None
         self._transfer_threads_started = False
+        # group_id -> whether _expand_lookup_keys_by_rank is the identity for
+        # that group. Topology is fixed after init, so computed once per group.
+        self._identity_rank_expansion_cache: dict[int, bool] = {}
         self.external_slot_release_waiter: Callable[[int], None] | None = None
         # Per-rank GVA cache: maps per-rank store key to its allocated GVA.
         # batch_alloc is non-idempotent (returns MMC_DUPLICATED_OBJECT for an
@@ -791,6 +795,7 @@ class KVPoolWorker:
                     self.group_uses_align_state,
                     self.enable_kv_events,
                     worker=self if self.tp_mismatch else None,
+                    record_operation=self._record_kv_connector_operation,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -3190,10 +3195,35 @@ class KVPoolWorker:
             value_end = len(key)
         return f"{key[:value_start]}{value}{key[value_end:]}"
 
+    def _is_identity_rank_expansion(self, group_id: int, num_head_or_tp_ranks: int) -> bool:
+        """Whether rank expansion is the identity for this group's keys.
+
+        With one PP/DCP stage and a single head/TP variant, the only expanded
+        key carries (pp_rank=0, dcp_rank=0, head_or_tp_rank=0). When the local
+        key prefix already carries exactly those fields, expansion can return
+        the input unchanged instead of rewriting every key string with three
+        ``str.replace`` scans per key.
+        """
+        cached = self._identity_rank_expansion_cache.get(group_id)
+        if cached is None:
+            group_metadata = self.token_database.metadata[group_id]
+            cached = (
+                self.pp_size == 1
+                and self.dcp_size == 1
+                and num_head_or_tp_ranks == 1
+                and group_metadata.pp_rank == 0
+                and group_metadata.dcp_rank == 0
+                and group_metadata.head_or_tp_rank == 0
+            )
+            self._identity_rank_expansion_cache[group_id] = cached
+        return cached
+
     def _expand_lookup_keys_by_rank(self, keys: list[str], group_id: int) -> list[str]:
         # PCP replicas share keys; expand only the physical KV partitions.
-        expanded: list[str] = []
         num_head_or_tp_ranks = self.get_group_tp_size(group_id)
+        if self._is_identity_rank_expansion(group_id, num_head_or_tp_ranks):
+            return keys
+        expanded: list[str] = []
         # Keep each rank shard's block/layer keys contiguous to match
         # lookup_scheduler()'s [rank_shard][block] result slicing.
         for pp_rank in range(self.pp_size):
@@ -3262,7 +3292,9 @@ class KVPoolWorker:
                 variant_counts.append(len(variants))
 
             if keys:
+                exists_start = time.perf_counter()
                 res = self.m_store.exists(keys)  # type: ignore[assignment]
+                self._record_kv_connector_operation("lookup_exists", time.perf_counter() - exists_start, len(keys))
                 offset = 0
                 for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
                     values = res[offset : offset + count]  # type: ignore[index]
@@ -3271,12 +3303,11 @@ class KVPoolWorker:
                     offset += count
 
             logger.debug(
-                "KV pool coordinator lookup group=%d token_len=%d keys=%d exists_chunks=%d sample_keys=%s",
+                "KV pool coordinator lookup group=%d token_len=%d keys=%d exists_chunks=%d",
                 group_id,
                 token_len,
                 len(keys),
                 len(present),
-                keys[:3],
             )
             return present
 
@@ -3300,6 +3331,30 @@ class KVPoolWorker:
         :param tokens: the input tokens, with shape [seq_len]
         :return: An int indicating how many prefix tokens are cached.
         """
+        lookup_start = time.perf_counter()
+        try:
+            return self._lookup_scheduler_impl(
+                token_len,
+                block_hashes,
+                kv_cache_group_ids,
+                use_layerwise,
+                hbm_hit_tokens,
+            )
+        finally:
+            self._record_kv_connector_operation(
+                "lookup_total",
+                time.perf_counter() - lookup_start,
+                0,
+            )
+
+    def _lookup_scheduler_impl(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        kv_cache_group_ids: list[int] | None = None,
+        use_layerwise: bool = False,
+        hbm_hit_tokens: int = 0,
+    ) -> int:
         try:
             hits: list[list[int]] = []
             max_hit_position = self.max_model_len
@@ -3322,7 +3377,13 @@ class KVPoolWorker:
 
                 multi_tp_keys = self._expand_lookup_keys_by_rank(keys, group_id)
                 num_ranks = len(multi_tp_keys) // len(keys)
+                exists_start = time.perf_counter()
                 res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
+                self._record_kv_connector_operation(
+                    "lookup_exists",
+                    time.perf_counter() - exists_start,
+                    len(multi_tp_keys),
+                )
                 num_block = len(keys)
                 if use_layerwise:
                     res = self.check_all_layers_exists(
@@ -3334,18 +3395,19 @@ class KVPoolWorker:
                     res[i * num_block : (i + 1) * num_block]  # type: ignore[index]
                     for i in range(num_ranks)
                 ]
-                logger.debug(
-                    "KV pool lookup request token_len=%d group=%d keys=%d multi_tp_keys=%d "
-                    "exists_count=%d/%d exists_sample=%s sample_keys=%s",
-                    token_len,
-                    group_id,
-                    len(keys),
-                    len(multi_tp_keys),
-                    sum(1 for value in res if value == 1),  # type: ignore[union-attr]
-                    len(res),
-                    list(res[: min(12, len(res))]),  # type: ignore[index]
-                    multi_tp_keys[:3],
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "KV pool lookup request token_len=%d group=%d keys=%d multi_tp_keys=%d "
+                        "exists_count=%d/%d exists_sample=%s sample_keys=%s",
+                        token_len,
+                        group_id,
+                        len(keys),
+                        len(multi_tp_keys),
+                        sum(1 for value in res if value == 1),  # type: ignore[union-attr]
+                        len(res),
+                        list(res[: min(12, len(res))]),  # type: ignore[index]
+                        multi_tp_keys[:3],
+                    )
                 if group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]:
                     group_hits = self.find_all_discontinuous_hit_positions(
                         multi_tp_values, ends, num_block, max_hit_position, self.cache_transfer_granularity

@@ -33,6 +33,9 @@ _REACHABLE_MASK_OPTIONAL_KWARGS = frozenset(("retention_interval", "num_prompt_t
 # manager class -> accepted reachable_block_mask parameter names.
 _REACHABLE_MASK_KWARGS_CACHE: dict[type[SingleTypeKVCacheManager], frozenset[str]] = {}
 
+# Upper bound for the per-coordinator reachable-mask result cache.
+_REACHABLE_MASK_CACHE_MAX_ENTRIES = 128
+
 # Per-group pool query used by the shared reachable hit lookup: returns the
 # subset of ``group_block_hashes`` present in the pool (all replicas valid).
 # A None ``lookup_mask`` means the group has no reachability limits.
@@ -109,6 +112,17 @@ class AscendStoreCoordinator:
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_groups)))
 
+        # (aligned_token_len, retention_interval, num_prompt_tokens) -> masks.
+        # Masks are deterministic in these inputs, so repeated store/lookup
+        # calls with the same request shape reuse the cached lists instead of
+        # rebuilding them per request. Cached mask lists are shared across
+        # calls and must be treated as immutable; callers that need to mutate
+        # must copy first (as _handle_stored_request already does).
+        self._reachable_mask_cache: dict[
+            tuple[int, int | None, int | None],
+            list[tuple[int, list[bool] | None]],
+        ] = {}
+
         self._verify_and_split_kv_cache_groups()
 
     def _verify_and_split_kv_cache_groups(self) -> None:
@@ -183,6 +197,10 @@ class AscendStoreCoordinator:
         assert aligned_token_len % self.lcm_block_size == 0, (
             f"aligned_token_len ({aligned_token_len}) must be a multiple of lcm_block_size ({self.lcm_block_size})"
         )
+        cache_key = (aligned_token_len, retention_interval, num_prompt_tokens)
+        cached = self._reachable_mask_cache.get(cache_key)
+        if cached is not None:
+            return cached
         masks: list[tuple[int, list[bool] | None]] = []
         for group_id, spec in enumerate(self.group_effective_specs):
             num_chunks = aligned_token_len // self.group_effective_block_sizes[group_id]
@@ -201,6 +219,9 @@ class AscendStoreCoordinator:
                 num_prompt_tokens=num_prompt_tokens,
             )
             masks.append((num_chunks, mask))
+        if len(self._reachable_mask_cache) >= _REACHABLE_MASK_CACHE_MAX_ENTRIES:
+            self._reachable_mask_cache.pop(next(iter(self._reachable_mask_cache)))
+        self._reachable_mask_cache[cache_key] = masks
         return masks
 
     def store_mask(

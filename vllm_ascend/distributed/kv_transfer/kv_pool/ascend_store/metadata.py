@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -500,6 +501,46 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
+    def prepare_values_batch(
+        self,
+        starts: Sequence[int],
+        ends: Sequence[int],
+        key_block_ids: Sequence[int],
+        kv_cache_group_id: int = 0,
+        cache_role: str = "kv",
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Vectorized equivalent of per-chunk prepare_value with explicit block ids.
+
+        Returns (addrs, sizes) with one row per chunk, matching what calling
+        ``prepare_value(start, end, _, block_id=...)`` per chunk produces. The
+        per-entry Python loop is moved into numpy so bulk save/load paths do
+        not pay keys x cache-entries interpreter iterations.
+        """
+        count = len(starts)
+        if count == 0:
+            return [], []
+        group_addrs, group_block_len, group_block_stride = self._get_group_buffers(kv_cache_group_id, cache_role)
+        num_entries = len(group_addrs)
+        length = len(group_block_len)
+        if num_entries == 0 or length == 0:
+            return [[] for _ in range(count)], [[] for _ in range(count)]
+        group_block_size = self.get_block_size(kv_cache_group_id)
+        entry_index = np.arange(num_entries) % length
+        base_addrs = np.asarray(group_addrs, dtype=np.int64)
+        entry_block_len = np.asarray(group_block_len, dtype=np.int64)[entry_index]
+        if group_block_stride:
+            entry_stride = np.asarray(group_block_stride, dtype=np.int64)[entry_index]
+        else:
+            entry_stride = entry_block_len
+        block_ids = np.asarray(key_block_ids, dtype=np.int64)
+        addr_matrix = base_addrs[None, :] + block_ids[:, None] * entry_stride[None, :]
+        chunk_tokens = np.asarray(ends, dtype=np.int64) - np.asarray(starts, dtype=np.int64)
+        # prepare_value computes int(block_len / group_block_size * tokens);
+        # for these magnitudes the float expression is exact, so integer floor
+        # division produces the same value.
+        size_matrix = (entry_block_len[None, :] * chunk_tokens[:, None]) // group_block_size
+        return addr_matrix.tolist(), size_matrix.tolist()
+
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         group_block_size = self.get_block_size(0)
         block_idx = start // group_block_size
@@ -536,6 +577,7 @@ class ChunkedTokenDatabase:
         chunk_filter: Callable[[int], bool] | None = None,
         shard_rank: int | None = None,
         shard_size: int | None = None,
+        skip_chunk_range: tuple[int, int] | None = None,
     ) -> Iterable[tuple[int, int, BlockHash | str, int | None]]:
         if not block_hashes:
             return
@@ -547,7 +589,22 @@ class ChunkedTokenDatabase:
         block_id_offset = max(num_logical_blocks - len(block_ids), 0) if block_ids is not None else 0
         candidate_index = 0
 
-        for chunk_id in range(num_logical_blocks):
+        # [start, end) chunk ids are rejected by the caller's skip predicate
+        # (their token range lies inside [skip_start, skip_end)) and would
+        # never become shard candidates; jump over them instead of evaluating
+        # chunk_filter per chunk. chunk_filter stays authoritative for every
+        # chunk that is actually iterated.
+        chunk_ids: Iterable[int] = range(num_logical_blocks)
+        if skip_chunk_range is not None and skip_chunk_range[1] > skip_chunk_range[0]:
+            skip_start_chunk = max(skip_chunk_range[0], 0)
+            skip_end_chunk = min(skip_chunk_range[1], num_logical_blocks)
+            if skip_end_chunk > skip_start_chunk:
+                chunk_ids = itertools.chain(
+                    range(0, skip_start_chunk),
+                    range(skip_end_chunk, num_logical_blocks),
+                )
+
+        for chunk_id in chunk_ids:
             start_idx = chunk_id * logical_block_size
             end_idx = min(start_idx + logical_block_size, token_len)
             if start_idx < mask_num:
@@ -611,6 +668,7 @@ class ChunkedTokenDatabase:
         mask_num: int = 0,
         kv_cache_group_id: int = 0,
         chunk_filter: Callable[[int], bool] | None = None,
+        skip_chunk_range: tuple[int, int] | None = None,
     ) -> Iterable[tuple[int, int, str, BlockHash | str]]:
         """Yield cache key strings directly without materializing PoolKey objects."""
         prefix = self._get_key_prefix(kv_cache_group_id)
@@ -620,6 +678,7 @@ class ChunkedTokenDatabase:
             mask_num,
             kv_cache_group_id,
             chunk_filter=chunk_filter,
+            skip_chunk_range=skip_chunk_range,
         ):
             yield start, end, prefix + block_hash_to_str(hash_val), hash_val
 
@@ -634,6 +693,7 @@ class ChunkedTokenDatabase:
         chunk_filter: Callable[[int], bool] | None = None,
         shard_rank: int | None = None,
         shard_size: int | None = None,
+        skip_chunk_range: tuple[int, int] | None = None,
     ) -> Iterable[tuple[int, int, str, BlockHash | str, int]]:
         """Yield cache key strings and resolved block ids without PoolKey allocation."""
         prefix = self._get_key_prefix(kv_cache_group_id)
@@ -647,6 +707,7 @@ class ChunkedTokenDatabase:
             chunk_filter=chunk_filter,
             shard_rank=shard_rank,
             shard_size=shard_size,
+            skip_chunk_range=skip_chunk_range,
         ):
             assert block_id is not None
             yield start, end, prefix + block_hash_to_str(hash_val), hash_val, block_id

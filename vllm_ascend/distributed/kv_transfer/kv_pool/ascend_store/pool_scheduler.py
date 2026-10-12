@@ -112,6 +112,13 @@ class KVPoolScheduler:
         )
         # request_id -> (vllm cached tokes, kvpool cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
+        # request_id -> (num_computed_tokens, external hit tokens) from the
+        # last pool lookup. Waiting requests re-run get_num_new_matched_tokens
+        # on every scheduler step while chunked prefill keeps them
+        # unscheduled; request block hashes are frozen, so the cached answer
+        # avoids repeating the full lookup RPC each step. Entries are dropped
+        # when the request finishes or is preempted.
+        self._hit_lookup_cache: dict[str, tuple[int, int]] = {}
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
 
@@ -598,14 +605,22 @@ class KVPoolScheduler:
             else:
                 if num_computed_tokens >= token_len:
                     return 0, False
-                if self.client is None:
-                    self.client = LookupKeyClient(self.vllm_config)
-                num_external_hit_tokens = self.client.lookup(
-                    token_len,
-                    request.block_hashes,
-                    self.kv_cache_group_ids,
-                    hbm_hit_tokens=num_computed_tokens,
-                )
+                cached_lookup = self._hit_lookup_cache.get(request.request_id)
+                if cached_lookup is not None and cached_lookup[0] == num_computed_tokens:
+                    num_external_hit_tokens = cached_lookup[1]
+                else:
+                    if self.client is None:
+                        self.client = LookupKeyClient(self.vllm_config)
+                    num_external_hit_tokens = self.client.lookup(
+                        token_len,
+                        request.block_hashes,
+                        self.kv_cache_group_ids,
+                        hbm_hit_tokens=num_computed_tokens,
+                    )
+                    self._hit_lookup_cache[request.request_id] = (
+                        num_computed_tokens,
+                        num_external_hit_tokens,
+                    )
 
         if num_external_hit_tokens == 0:
             return 0, False
@@ -939,12 +954,14 @@ class KVPoolScheduler:
             self._unfinished_requests.pop(finished_req_id, None)
             self._preempted_req_ids.discard(finished_req_id)
             self._loading_req_ids.discard(finished_req_id)
+            self._hit_lookup_cache.pop(finished_req_id, None)
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
             self._loading_req_ids.discard(req_id)
+            self._hit_lookup_cache.pop(req_id, None)
 
         meta = AscendConnectorMetadata(
             scheduler_output.preempted_req_ids,

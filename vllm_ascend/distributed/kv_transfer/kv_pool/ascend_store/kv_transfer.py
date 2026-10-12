@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import queue
 import threading
 import time
@@ -533,6 +534,9 @@ class KVTransferThread(threading.Thread):
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
         self._fatal_error: BaseException | None = None
+        # Optional per-operation timing sink; subclasses that want their
+        # exists/put calls timed assign it at construction.
+        self._record_operation_cb: Callable[[str, float, int], None] | None = None
 
     def _get_block_size(self, kv_cache_group_id: int = 0) -> int:
         if isinstance(self.block_size, list):
@@ -813,7 +817,10 @@ class KVTransferThread(threading.Thread):
         """
         if not require_exists_check and not self.m_store.requires_exists_before_put:
             return list(range(len(keys)))
+        exists_start = time.perf_counter() if self._record_operation_cb is not None else 0.0
         exists_states = self.lookup(keys)
+        if self._record_operation_cb is not None:
+            self._record_operation_cb("store_exists", time.perf_counter() - exists_start, len(keys))
         return [index for index, exists in enumerate(exists_states) if not exists]
 
     def update_kv_event(self, event: list[BlockStored]):
@@ -898,6 +905,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         group_uses_align_state: list[bool] | None = None,
         enable_kv_event: bool = False,
         worker: Any = None,
+        record_operation: Callable[[str, float, int], None] | None = None,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, tp_size, dcp_size, ready_event, name="KVCacheSendingThread"
@@ -911,6 +919,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.completed_events_lock = threading.Lock()
         self.completed_events: dict[int, int] = {}
         self.worker = worker
+        self._record_operation_cb = record_operation
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -1010,7 +1019,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         req_id = req_meta.req_id
         current_event = req_meta.current_event
         try:
+            mask_start = time.perf_counter() if self._record_operation_cb is not None else 0.0
             store_masks = self.token_database.store_mask(token_len, req_meta.num_prompt_tokens)
+            if self._record_operation_cb is not None:
+                self._record_operation_cb("store_mask", time.perf_counter() - mask_start, 0)
         except AssertionError as exc:
             logger.debug("Skip AscendStore store mask for unaligned request %s: %s", req_id, exc)
             store_masks = None
@@ -1032,23 +1044,33 @@ class KVCacheStoreSendingThread(KVTransferThread):
         for group_id in req_meta.kv_cache_group_ids or [0]:
             group_block_size = self._get_block_size(group_id)
 
+            # Chunks whose token range lies inside [skip_start, skip_end) are
+            # already pooled; compute their chunk-id span once so both the
+            # store mask rewrite and the chunk iterator skip them in bulk
+            # instead of re-evaluating should_skip per chunk. The span matches
+            # should_skip exactly: c*bs >= skip_start and c*bs + bs <= skip_end
+            # iff ceil(skip_start/bs) <= c < floor(skip_end/bs).
+            skip_chunk_range = (
+                (-(-skip_start // group_block_size), skip_end // group_block_size) if skip_end > skip_start else None
+            )
+
             group_store_mask = (
                 list(store_masks[group_id]) if store_masks is not None and group_id < len(store_masks) else None
             )
             if group_store_mask is not None:
-                skipped_chunks = 0
-                for chunk_id, allowed in enumerate(group_store_mask):
-                    start = chunk_id * group_block_size
-                    if allowed and should_skip(start, start + group_block_size):
-                        group_store_mask[chunk_id] = False
-                        skipped_chunks += 1
-                if skipped_chunks:
-                    logger.debug(
-                        "KV pool put skipped %d pooled chunks for request %s group %d",
-                        skipped_chunks,
-                        req_id,
-                        group_id,
-                    )
+                if skip_chunk_range is not None:
+                    mask_lo = max(skip_chunk_range[0], 0)
+                    mask_hi = min(skip_chunk_range[1], len(group_store_mask))
+                    if mask_hi > mask_lo:
+                        skipped_chunks = sum(group_store_mask[mask_lo:mask_hi])
+                        group_store_mask[mask_lo:mask_hi] = [False] * (mask_hi - mask_lo)
+                        if skipped_chunks:
+                            logger.debug(
+                                "KV pool put skipped %d pooled chunks for request %s group %d",
+                                skipped_chunks,
+                                req_id,
+                                group_id,
+                            )
                 if not group_store_mask or not any(group_store_mask):
                     continue
 
@@ -1089,7 +1111,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 chunk_filter=chunk_filter,
                 shard_rank=self.pcp_rank * tp_replicas + self.tp_rank % tp_replicas,
                 shard_size=self.pcp_size * tp_replicas,
+                skip_chunk_range=skip_chunk_range,
             )
+            key_build_start = time.perf_counter() if self._record_operation_cb is not None else 0.0
             for start, end, key, block_hash, block_id in iterator:
                 starts.append(start)
                 ends.append(end)
@@ -1097,6 +1121,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 if self.enable_kv_event:
                     block_hashes.append(block_hash)
                 key_block_ids.append(block_id)
+            if self._record_operation_cb is not None:
+                self._record_operation_cb("store_key_build", time.perf_counter() - key_build_start, len(keys))
 
             if not keys:
                 continue
@@ -1128,25 +1154,26 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     getattr(self.token_database, "hash_block_size", group_block_size),
                 )
                 all_hashes = [maybe_convert_block_hash(bh) for bh in group_block_hashes]
-            logger.debug(
-                "KV pool put request=%s group=%d token_len=%d keys=%d sample_keys=%s",
-                req_id,
-                group_id,
-                token_len,
-                len(keys),
-                keys[:3],
-            )
-            for index, start in enumerate(starts):
-                addr, size, _ = self._prepare_value(
-                    start,
-                    ends[index],
-                    block_ids,
-                    kv_cache_group_id=group_id,
-                    block_id=key_block_ids[index],
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KV pool put request=%s group=%d token_len=%d keys=%d sample_keys=%s",
+                    req_id,
+                    group_id,
+                    token_len,
+                    len(keys),
+                    keys[:3],
                 )
-                addrs.append(addr)
-                sizes.append(size)
-                if self.enable_kv_event:
+            if self.enable_kv_event:
+                for index, start in enumerate(starts):
+                    addr, size, _ = self._prepare_value(
+                        start,
+                        ends[index],
+                        block_ids,
+                        kv_cache_group_id=group_id,
+                        block_id=key_block_ids[index],
+                    )
+                    addrs.append(addr)
+                    sizes.append(size)
                     token_ids = req_meta.token_ids[start : ends[index]] if req_meta.token_ids is not None else None
                     block_size = (
                         req_meta.original_block_size[group_id]
@@ -1170,6 +1197,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         )
                         stored_events.append(stored_event)
                         logger.debug("Added kv cache event '%s' to kv cache events queue", stored_event)
+            else:
+                addrs, sizes = self.token_database.prepare_values_batch(
+                    starts,
+                    ends,
+                    key_block_ids,
+                    kv_cache_group_id=group_id,
+                )
 
             if self.kv_role == "kv_consumer":
                 keys, addrs, sizes = self._decode_adaptor_prefill_pp(
@@ -1180,7 +1214,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
             if current_event is not None:
                 current_event.synchronize()
+            put_start = time.perf_counter() if self._record_operation_cb is not None else 0.0
             self.m_store.put(keys, addrs, sizes)
+            if self._record_operation_cb is not None:
+                self._record_operation_cb("store_put", time.perf_counter() - put_start, len(keys))
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
 
@@ -1260,18 +1297,27 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     skip_null_blocks=self._skip_null_blocks(req_meta, group_id),
                     chunk_filter=chunk_filter,
                 )
+                group_starts: list[int] = []
+                group_ends: list[int] = []
+                group_keys: list[str] = []
+                group_block_ids: list[int] = []
                 for start, end, key, _block_hash, block_id in token_iter:
-                    addr, size, block_id = self._prepare_value(
-                        start,
-                        end,
-                        block_ids,
-                        kv_cache_group_id=group_id,
-                        block_id=block_id,
-                    )
-                    key_list.append(key)
-                    addr_list.append(addr)
-                    size_list.append(size)
-                    block_id_list.append(block_id)
+                    group_starts.append(start)
+                    group_ends.append(end)
+                    group_keys.append(key)
+                    group_block_ids.append(block_id)
+                if not group_keys:
+                    continue
+                group_addrs, group_sizes = self.token_database.prepare_values_batch(
+                    group_starts,
+                    group_ends,
+                    group_block_ids,
+                    kv_cache_group_id=group_id,
+                )
+                key_list.extend(group_keys)
+                addr_list.extend(group_addrs)
+                size_list.extend(group_sizes)
+                block_id_list.extend(group_block_ids)
             if not key_list:
                 self.set_finished_request(req_id)
                 return
@@ -1281,14 +1327,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             block_id_list_c = (
                 block_id_list[self.tp_rank % len(block_id_list) :] + block_id_list[: self.tp_rank % len(block_id_list)]
             )
-            logger.debug(
-                "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
-                req_id,
-                token_len,
-                req_meta.kv_cache_group_ids or [0],
-                len(key_list_c),
-                key_list_c[:3],
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
+                    req_id,
+                    token_len,
+                    req_meta.kv_cache_group_ids or [0],
+                    len(key_list_c),
+                    key_list_c[:3],
+                )
             load_get_start = time.perf_counter() if self._record_operation_cb is not None else 0.0
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
             if self._record_operation_cb is not None:

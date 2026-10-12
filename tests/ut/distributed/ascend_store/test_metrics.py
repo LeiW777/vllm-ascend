@@ -54,6 +54,36 @@ def test_stats_aggregate_and_reduce():
     }
 
 
+def test_stats_record_and_observe_additional_operations():
+    stats = AscendStoreKVConnectorStats()
+    stats.record_operation("lookup_exists", 0.05, 100)
+    stats.record_operation("lookup_exists", 0.15, 50)
+    stats.record_operation("store_put", 0.5, 40)
+    stats.record_operation("unknown_operation", 1.0, 1)
+
+    reduced = stats.reduce()
+    assert reduced["ascend_store_lookup_exists_count"] == 2
+    assert reduced["ascend_store_lookup_exists_avg_ms"] == 100.0
+    assert reduced["ascend_store_lookup_exists_keys"] == 150
+    assert reduced["ascend_store_store_put_count"] == 1
+    assert reduced["ascend_store_store_put_keys"] == 40
+    assert "ascend_store_unknown_operation_count" not in reduced
+
+    metric_types = {Gauge: _Metric, Counter: _Metric, Histogram: _Metric}
+    labelvalues = {0: ["test-model"]}
+    prom = AscendStorePromMetrics(MagicMock(), metric_types, ["model_name"], labelvalues)
+    data = stats.reduce()
+    data.update(
+        {
+            "lookup_exists_duration_seconds": [0.05, 0.15],
+            "lookup_exists_keys": 150,
+        }
+    )
+    prom.observe(data)
+    assert prom._operation_duration_metrics["lookup_exists"][0].observed == [0.05, 0.15]
+    assert prom._operation_key_metrics["lookup_exists"][0].value == 150
+
+
 def test_prom_metrics_observe():
     metric_types = {Gauge: _Metric, Counter: _Metric, Histogram: _Metric}
     labelnames = ["model_name"]
