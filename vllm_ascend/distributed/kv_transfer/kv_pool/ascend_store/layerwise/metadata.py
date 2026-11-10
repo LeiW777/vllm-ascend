@@ -107,29 +107,6 @@ def masked_block_runs(
 
 
 @dataclass
-class LayerBatchReqMeta:
-    req_ids: list[str]
-    layer_id: int
-    is_last_chunks: list[bool | None] = field(default_factory=list)
-    addr_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    size_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    gvas_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    load_keys: list[str] = field(default_factory=list)
-
-
-@dataclass
-class LayerRangeReqMeta:
-    req_ids: list[str]
-    layer_id: int
-    block_ids: list[int]
-    keys: list[str]
-    all_buffers: list[list[int]]
-    all_sizes: list[list[int]]
-    all_offsets: list[list[int]]
-    load_keys: list[str] = field(default_factory=list)
-
-
-@dataclass
 class LayerBlockRange:
     request: ReqMeta
     start_block: int
@@ -138,23 +115,51 @@ class LayerBlockRange:
 
 
 @dataclass
-class SharedBlockData:
-    """Pre-computed block data shared across all layers for the same request."""
+class LayerTransferMeta:
+    """One layerwise transfer description covering both data planes.
 
-    block_ids_arr: np.ndarray
-    block_gvas_arr: np.ndarray | None
+    Built in two stages with one type: ``LayerBatchBuilder.build_shared``
+    fills the layer-invariant block rows once per task (attached to every
+    layer's ``LayerTransferTask.shared_block_data``), and
+    ``LayerBatchBuilder.build_addrs`` projects those rows onto one layer's
+    addresses. Exactly one plane payload is populated per projection: flat
+    GVA batch arrays for the memcache plane, or per-key range rows for the
+    block-key plane.
+    """
+
+    # --- request scope (layer-invariant) ---
     req_ids: list[str]
-    is_last_chunks: list[bool | None]
+    is_last_chunks: list[bool | None] = field(default_factory=list)
+
+    # --- block rows shared by every layer of the task ---
+    block_ids_arr: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    block_gvas_arr: np.ndarray | None = None
     block_keys: list[str] | None = None
     save_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
+
+    # --- per-layer projection (filled by build_addrs) ---
+    layer_id: int = -1
+    # GVA plane: flat device/pool address descriptors.
+    addr_array: np.ndarray | None = None
+    size_array: np.ndarray | None = None
+    gvas_array: np.ndarray | None = None
+    # Block-key plane: one buffer/size/offset row per block key.
+    all_buffers: list[list[int]] | None = None
+    all_sizes: list[list[int]] | None = None
+    all_offsets: list[list[int]] | None = None
+
+    @property
+    def uses_key_ranges(self) -> bool:
+        """Whether build_addrs projected this meta onto per-key range rows."""
+        return self.all_buffers is not None
 
 
 @dataclass
 class LayerTransferTask:
     layer_id: int
     block_ranges: list[LayerBlockRange]
-    shared_block_data: SharedBlockData | None = None
+    shared_block_data: LayerTransferMeta | None = None
     group_id: int = 0
     layer_idx_in_group: int = 0
     # Publish newly allocated GVA keys after this task completes the final

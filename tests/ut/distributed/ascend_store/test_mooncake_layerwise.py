@@ -36,7 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_trans
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
     LayerBlockRange,
-    LayerRangeReqMeta,
+    LayerTransferMeta,
     LayerTransferTask,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -118,10 +118,11 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
 
         result = builder.build(task)
 
-        self.assertIsInstance(result, LayerRangeReqMeta)
-        assert isinstance(result, LayerRangeReqMeta)
-        self.assertEqual(result.keys, ["key"])
-        self.assertEqual(result.block_ids, [2])
+        self.assertIsInstance(result, LayerTransferMeta)
+        assert isinstance(result, LayerTransferMeta)
+        self.assertTrue(result.uses_key_ranges)
+        self.assertEqual(result.block_keys, ["key"])
+        self.assertEqual(result.block_ids_arr.tolist(), [2])
         self.assertEqual(result.all_buffers, [[3600]])
         self.assertEqual(result.all_sizes, [[30]])
         self.assertEqual(result.all_offsets, [[30]])

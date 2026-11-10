@@ -41,8 +41,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import LayerBatchBuilder
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
     LayerBlockRange,
+    LayerTransferMeta,
     LayerTransferTask,
-    SharedBlockData,
     get_partial_block_index,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import LayerwiseKVPoolWorker
@@ -2055,7 +2055,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         first_task = LayerTransferTask(layer_id=0, block_ranges=[])
         last_task = LayerTransferTask(layer_id=1, block_ranges=[])
         worker.layer_save_tasks = [[first_task], [last_task], []]
-        shared = SharedBlockData(
+        shared = LayerTransferMeta(
             block_ids_arr=np.asarray([0]),
             block_gvas_arr=np.asarray([100]),
             req_ids=["r1"],
@@ -2256,7 +2256,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
                     [LayerTransferTask(layer, [], group_id=group) for group in range(2)] for layer in range(2)
                 ]
                 shared = [
-                    SharedBlockData(
+                    LayerTransferMeta(
                         block_ids_arr=np.asarray([group]),
                         block_gvas_arr=np.asarray([100 + group]),
                         req_ids=["r1"],

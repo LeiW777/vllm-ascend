@@ -55,8 +55,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwis
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
     LayerBlockRange,
     LayerLoadTask,
+    LayerTransferMeta,
     LayerTransferTask,
-    SharedBlockData,
     get_partial_block_index,
     masked_block_runs,
 )
@@ -1267,7 +1267,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         """Build shared block data once and attach to all layer save tasks.
 
         For the layerwise send thread (KVCacheStoreLayerSendingThread):
-        pre-computes SharedBlockData via LayerBatchBuilder.build_shared().
+        pre-computes the shared LayerTransferMeta via
+        LayerBatchBuilder.build_shared().
 
         In multi-group mode, shared data is built per-group because each
         group has different block_ranges (different effective_block_size).
@@ -1860,7 +1861,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             return
         for group_id in range(self.num_kv_cache_groups):
             shared_by_ranges: dict[
-                tuple[bool, tuple[tuple[int, int, int, int | None], ...]], SharedBlockData | None
+                tuple[bool, tuple[tuple[int, int, int, int | None], ...]], LayerTransferMeta | None
             ] = {}
             for layer_id in range(self.num_layers):
                 for task in self.layer_load_tasks[layer_id]:

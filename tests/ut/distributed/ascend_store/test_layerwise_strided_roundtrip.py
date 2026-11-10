@@ -10,7 +10,7 @@ import torch
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 from tests.ut.distributed.ascend_store.test_segmented_cache_transfer import make_database, make_worker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import LayerBatchBuilder
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import SharedBlockData
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import LayerTransferMeta
 
 
 def components(scale, padding, dtype, tokens=2, nope=8, rope=1):
@@ -34,7 +34,7 @@ def addresses(database, mode, scale, tokens, token_count=None, layer_id=0, token
         addr, size, _ = database.prepare_value_layer(start, end, [0, 1], layer_id)
         return addr, size, None
     builder = LayerBatchBuilder(database, sum(database.group_block_len[0]), database.group_num_layers["kv"][0])
-    shared = SharedBlockData(
+    shared = LayerTransferMeta(
         block_ids_arr=np.array([1], dtype=np.int64),
         block_gvas_arr=np.array([4096], dtype=np.int64) if mode == "gva" else None,
         req_ids=["regression"],

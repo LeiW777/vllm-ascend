@@ -25,11 +25,10 @@ import numpy as np
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_events import BlockStored
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
-    LayerBatchReqMeta,
     LayerBlockRange,
     LayerLoadTask,
+    LayerTransferMeta,
     LayerTransferTask,
-    SharedBlockData,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
@@ -271,7 +270,7 @@ class TestGVALayerTransferFailures(unittest.TestCase):
         store.store = MagicMock(batch_copy=MagicMock(return_value=0))
         store.batch_write_finish.return_value = [0]
         builder = MagicMock()
-        builder.build_addrs.return_value = LayerBatchReqMeta(
+        builder.build_addrs.return_value = LayerTransferMeta(
             req_ids=["r1"],
             layer_id=0,
             is_last_chunks=[True],
@@ -298,7 +297,7 @@ class TestGVALayerTransferFailures(unittest.TestCase):
         task = LayerTransferTask(
             layer_id=0,
             block_ranges=[LayerBlockRange(ReqMeta("r1", block_ids=[7]), 0, 1)],
-            shared_block_data=SharedBlockData(
+            shared_block_data=LayerTransferMeta(
                 block_ids_arr=np.asarray([0]),
                 block_gvas_arr=np.asarray([100]),
                 req_ids=["r1"],
@@ -382,7 +381,7 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
         save_finished = [threading.Event(), threading.Event()]
         sync_events = [MagicMock(), MagicMock()]
         builder = MagicMock()
-        builder.build_addrs.return_value = LayerBatchReqMeta(
+        builder.build_addrs.return_value = LayerTransferMeta(
             req_ids=["r1"],
             layer_id=1,
             is_last_chunks=[False],
@@ -420,7 +419,7 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
                 task = LayerTransferTask(
                     layer_id=1,
                     block_ranges=[LayerBlockRange(request, 0, 2)],
-                    shared_block_data=SharedBlockData(
+                    shared_block_data=LayerTransferMeta(
                         block_ids_arr=np.asarray([7, 8]),
                         block_gvas_arr=np.asarray([100, 200]),
                         req_ids=["r1"],
@@ -443,7 +442,7 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
         task = LayerTransferTask(
             layer_id=1,
             block_ranges=[],
-            shared_block_data=SharedBlockData(
+            shared_block_data=LayerTransferMeta(
                 block_ids_arr=np.asarray([0]),
                 block_gvas_arr=np.asarray([100]),
                 req_ids=["r1"],
@@ -511,7 +510,7 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
         task = LayerTransferTask(
             layer_id=1,
             block_ranges=[],
-            shared_block_data=SharedBlockData(
+            shared_block_data=LayerTransferMeta(
                 block_ids_arr=np.asarray([0]),
                 block_gvas_arr=np.asarray([100]),
                 req_ids=["r1"],
