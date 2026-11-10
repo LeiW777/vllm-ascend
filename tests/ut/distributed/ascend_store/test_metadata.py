@@ -22,7 +22,6 @@ from unittest.mock import MagicMock
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
-    LayerMultiBlockReqMeta,
     LayerPoolKey,
     masked_block_runs,
 )
@@ -803,22 +802,6 @@ class TestAscendConnectorMetadata(unittest.TestCase):
         meta.add_request(req)
         self.assertEqual(len(meta.requests), 1)
         self.assertEqual(meta.requests[0].req_id, "r1")
-
-
-class TestLayerMultiBlockReqMeta(unittest.TestCase):
-    def test_fields(self):
-        meta = LayerMultiBlockReqMeta(
-            req_id="r1",
-            keys=[],
-            starts=[0, 16],
-            ends=[16, 32],
-            block_ids=[0, 1],
-            layer_id=2,
-        )
-        self.assertEqual(meta.req_id, "r1")
-        self.assertEqual(meta.layer_id, 2)
-        self.assertTrue(meta.is_last_chunk)
-        self.assertIsNone(meta.current_event)
 
 
 if __name__ == "__main__":
