@@ -925,74 +925,117 @@ class RequestTracker:
 
 @dataclass(init=False)
 class ReqMeta:
-    # Request id
+    """Transfer metadata for one scheduled request.
+
+    ``__init__`` takes ``req_id`` positionally and every other parameter by
+    keyword; the keyword parameters and the field declarations below follow
+    the same order, grouped by lifecycle. Fields without an ``__init__``
+    parameter (``save_keys``, ``store_masks``, ``load_masks``) are filled by
+    the pool worker after construction.
+    """
+
+    # --- identity ---
     req_id: str
-    # End token for full-block KV save.
-    save_end_token: int
-    # Token length after this scheduled step finishes.
-    target_token_len: int
-    block_ids_by_group: list[list[int]]
-
-    block_hashes: list[BlockHash]
-
-    # First token that has not been saved before this metadata was built.
-    save_start_token: int = 0
-
-    can_save: bool | None = None
-    # load_spec
-    load_spec: LoadSpec | None = None
-
-    is_last_chunk: bool | None = None
-
-    current_event: torch.npu.Event | None = None
-    kv_cache_group_ids: list[int] | None = None
-    skip_null_blocks_by_group: list[bool] | None = None
-    num_prompt_tokens: int | None = None
-
-    # The following parameters are only used for kv event generation
-    # TODO: add lora_request which used for gen lora_id/lora_name in kv event
-    token_ids: list[int] | None = None
-    original_block_size: list[int] | int | None = None
-
-    event_id: int | None = None
     # Monotonic identity of one queued store operation. Unlike req_id, this
     # value is never reused while the engine is alive, so an old asynchronous
     # operation cannot update the save progress of a new request generation
     # that happens to reuse the same req_id.
     store_job_id: int | None = None
 
+    # --- chunk/save timing ---
+    # Token length covered by this scheduled chunk.
+    token_len_chunk: int = 0
+    # First token that has not been saved before this metadata was built.
+    save_start_token: int = 0
+    # End token for full-block KV save.
+    save_end_token: int = 0
+    # Token length after this scheduled step finishes.
+    target_token_len: int = 0
+
+    # --- save/load decisions ---
+    can_save: bool | None = None
+    load_spec: LoadSpec | None = None
+    is_last_chunk: bool | None = None
+
+    # --- block layout ---
+    block_ids_by_group: list[list[int]] = field(default_factory=list)
+    block_hashes: list[BlockHash] = field(default_factory=list)
+    partial_block_index: int | None = None
+    kv_cache_group_ids: list[int] | None = None
+    skip_null_blocks_by_group: list[bool] | None = None
+
+    # --- transfer ordering ---
+    # NPU event recorded after the producing compute; the transfer threads
+    # synchronize it before reading the KV buffers.
+    current_event: torch.npu.Event | None = None
+
+    # --- save-side GVA arrays (memcache plane) ---
+    block_ids_np: np.ndarray | None = None
+    block_ids_by_group_np: list[np.ndarray] | None = None
+    block_gvas_np: np.ndarray | None = None
+    block_gvas_by_group_np: list[np.ndarray] | None = None
+    gva_block_offset: int = 0
+    last_block_gva: int | None = None
+    partial_save_gva_per_group: list[int] = field(default_factory=list)
+
+    # --- load-side GVA arrays ---
+    load_block_gvas_np: np.ndarray | None = None
+    load_block_gvas_by_group_np: list[np.ndarray] | None = None
+    load_gva_block_offset: int = 0
+    partial_load_gva_per_group: list[int] = field(default_factory=list)
+
+    # --- block-key rows (block-key plane) ---
+    save_keys: list[str] | None = None
+    load_keys: list[str] = field(default_factory=list)
+    save_block_keys: list[str | None] = field(default_factory=list)
+    save_key_block_offset: int = 0
+    save_last_block_key: str | None = None
+    load_block_keys: list[str | None] = field(default_factory=list)
+    load_key_block_offset: int = 0
+    load_last_block_key: str | None = None
+
+    # --- reachability masks and prompt context for mask computation ---
+    num_prompt_tokens: int | None = None
+    # Per-group reachable masks for the layerwise transfer, computed once per
+    # scheduler step (None = no filtering, e.g. full-attention groups or when
+    # the coordinator is unavailable).
+    store_masks: tuple[Sequence[bool] | None, ...] | None = None
+    load_masks: tuple[Sequence[bool] | None, ...] | None = None
+
+    # --- kv-event context (only used for kv event generation) ---
+    # TODO: add lora_request which used for gen lora_id/lora_name in kv event
+    token_ids: list[int] | None = None
+    original_block_size: list[int] | int | None = None
+    event_id: int | None = None
+
     def __init__(
         self,
         req_id: str,
+        store_job_id: int | None = None,
         token_len_chunk: int | None = None,
-        block_ids_by_group: list[list[int]] | None = None,
-        block_hashes: list[BlockHash] | None = None,
+        save_start_token: int = 0,
+        save_end_token: int | None = None,
+        target_token_len: int | None = None,
         can_save: bool | None = None,
         load_spec: LoadSpec | None = None,
         is_last_chunk: bool | None = None,
-        current_event: torch.npu.Event | None = None,
+        block_ids_by_group: list[list[int]] | None = None,
+        block_ids: list[int] | list[list[int]] | None = None,
+        block_hashes: list[BlockHash] | None = None,
+        partial_block_index: int | None = None,
         kv_cache_group_ids: list[int] | None = None,
         skip_null_blocks_by_group: list[bool] | None = None,
-        num_prompt_tokens: int | None = None,
-        token_ids: list[int] | None = None,
-        original_block_size: list[int] | int | None = None,
-        block_ids: list[int] | list[list[int]] | None = None,
-        event_id: int | None = None,
-        store_job_id: int | None = None,
-        save_end_token: int | None = None,
-        target_token_len: int | None = None,
-        save_start_token: int = 0,
-        last_block_gva: int | None = None,
-        partial_block_index: int | None = None,
+        current_event: torch.npu.Event | None = None,
         block_ids_np: np.ndarray | None = None,
         block_ids_by_group_np: list[np.ndarray] | None = None,
         block_gvas_np: np.ndarray | None = None,
         block_gvas_by_group_np: list[np.ndarray] | None = None,
         gva_block_offset: int = 0,
+        last_block_gva: int | None = None,
+        partial_save_gva_per_group: list[int] | None = None,
         load_block_gvas_np: np.ndarray | None = None,
         load_block_gvas_by_group_np: list[np.ndarray] | None = None,
         load_gva_block_offset: int = 0,
-        partial_save_gva_per_group: list[int] | None = None,
         partial_load_gva_per_group: list[int] | None = None,
         save_block_keys: list[str | None] | None = None,
         save_key_block_offset: int = 0,
@@ -1001,40 +1044,40 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        num_prompt_tokens: int | None = None,
+        token_ids: list[int] | None = None,
+        original_block_size: list[int] | int | None = None,
+        event_id: int | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
         self.req_id = req_id
+        self.store_job_id = store_job_id
         self.token_len_chunk = token_len_chunk
+        self.save_start_token = save_start_token
         self.save_end_token = token_len_chunk if save_end_token is None else save_end_token
         self.target_token_len = token_len_chunk if target_token_len is None else target_token_len
-        self.save_start_token = save_start_token
+        self.can_save = can_save
+        self.load_spec = load_spec
+        self.is_last_chunk = is_last_chunk
         if block_ids_by_group is None:
             block_ids_by_group = normalize_block_ids_by_group(block_ids or [])
         self.block_ids_by_group = block_ids_by_group
         self.block_hashes = [] if block_hashes is None else block_hashes
-        self.can_save = can_save
-        self.load_spec = load_spec
-        self.is_last_chunk = is_last_chunk
-        self.current_event = current_event
+        self.partial_block_index = partial_block_index
         self.kv_cache_group_ids = kv_cache_group_ids
         self.skip_null_blocks_by_group = skip_null_blocks_by_group
-        self.num_prompt_tokens = num_prompt_tokens
-        self.token_ids = token_ids
-        self.original_block_size = original_block_size
-        self.event_id = event_id
-        self.store_job_id = store_job_id
-        self.last_block_gva = last_block_gva
-        self.partial_block_index = partial_block_index
+        self.current_event = current_event
         self.block_ids_np = block_ids_np
         self.block_ids_by_group_np = block_ids_by_group_np
         self.block_gvas_np = block_gvas_np
         self.block_gvas_by_group_np = block_gvas_by_group_np
         self.gva_block_offset = gva_block_offset
+        self.last_block_gva = last_block_gva
+        self.partial_save_gva_per_group = partial_save_gva_per_group or []
         self.load_block_gvas_np = load_block_gvas_np
         self.load_block_gvas_by_group_np = load_block_gvas_by_group_np
         self.load_gva_block_offset = load_gva_block_offset
-        self.partial_save_gva_per_group = partial_save_gva_per_group or []
         self.partial_load_gva_per_group = partial_load_gva_per_group or []
         self.save_block_keys = [] if save_block_keys is None else list(save_block_keys)
         self.save_key_block_offset = save_key_block_offset
@@ -1043,6 +1086,10 @@ class ReqMeta:
         self.load_key_block_offset = load_key_block_offset
         self.load_last_block_key = load_last_block_key
         self.load_keys = [] if load_keys is None else list(load_keys)
+        self.num_prompt_tokens = num_prompt_tokens
+        self.token_ids = token_ids
+        self.original_block_size = original_block_size
+        self.event_id = event_id
 
     @property
     def block_ids(self) -> list[int]:
@@ -1065,31 +1112,6 @@ class ReqMeta:
         if start < self.save_start_token or end > token_ids_end:
             return []
         return self.token_ids[start - self.save_start_token : end - self.save_start_token]
-
-    last_block_gva: int | None = None
-    partial_block_index: int | None = None
-    save_keys: list[str] | None = None
-    load_keys: list[str] = field(default_factory=list)
-    save_block_keys: list[str | None] = field(default_factory=list)
-    save_key_block_offset: int = 0
-    save_last_block_key: str | None = None
-    load_block_keys: list[str | None] = field(default_factory=list)
-    load_key_block_offset: int = 0
-    load_last_block_key: str | None = None
-
-    block_ids_np: np.ndarray | None = None
-    block_ids_by_group_np: list[np.ndarray] | None = None
-    block_gvas_np: np.ndarray | None = None
-    block_gvas_by_group_np: list[np.ndarray] | None = None
-    gva_block_offset: int = 0
-    load_block_gvas_by_group_np: list[np.ndarray] | None = None
-    partial_save_gva_per_group: list[int] = field(default_factory=list)
-    partial_load_gva_per_group: list[int] = field(default_factory=list)
-    # Per-group reachable masks for the layerwise transfer, computed once per
-    # scheduler step (None = no filtering, e.g. full-attention groups or when
-    # the coordinator is unavailable).
-    store_masks: tuple[Sequence[bool] | None, ...] | None = None
-    load_masks: tuple[Sequence[bool] | None, ...] | None = None
 
     @staticmethod
     def from_request_tracker(
